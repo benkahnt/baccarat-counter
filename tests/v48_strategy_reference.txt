@@ -1,0 +1,49 @@
+    std::optional<std::pair<double,double>>
+    PragmaticStrategyMath(const PragmaticTableRuntime& st) const {
+        if (strategy_ != StrategyMode::LuckyPairs) return std::nullopt;
+        if (!st.shoeTracked || !st.shoeTrusted || !st.strategyReady ||
+            st.strategyRanks.empty())
+            return std::nullopt;
+
+        // Live hand-count sanity gate. Immediately after gameresult the local
+        // counter may be exactly one hand ahead until the following
+        // ShoeSummary arrives. Anything else means the shoe is not safe for
+        // strategy output. This would have blocked the v21.2.16 triple-result
+        // failure even before ShoeSummary invalidated the shoe.
+        if (st.summaryTotalGames >= 0 &&
+            (st.shoeHands < st.summaryTotalGames ||
+             st.shoeHands > st.summaryTotalGames + 1))
+            return std::nullopt;
+
+        long long N = 0;
+        long long pairWays = 0;
+        for (const auto& kv : st.strategyRanks) {
+            const long long n = kv.second;
+            if (n < 0) return std::nullopt;
+            N += n;
+            pairWays += n * (n - 1) / 2;
+        }
+        if (N < 2) return std::nullopt;
+
+        const long long totalWays = N * (N - 1) / 2;
+        if (totalWays <= 0) return std::nullopt;
+
+        const double p = static_cast<double>(pairWays) /
+                         static_cast<double>(totalWays);
+        const double edge = 12.0 * p - 1.0; // 11:1 net
+        return std::make_pair(p, edge);
+    }
+
+    static bool StrategyMeetsThreshold(double edge) {
+        return edge >= gMinEdgeThreshold.load(std::memory_order_relaxed);
+    }
+
+    static std::string StrategySignal(double edge, bool /*bettingOpen*/) {
+        // Signal as early as mathematically possible: immediately after the
+        // previous completed hand updates the remaining-rank composition.
+        // BetsOpen is deliberately NOT a prerequisite; the user may need time
+        // to navigate to the table.
+        if (!StrategyMeetsThreshold(edge)) return "NICHT SETZEN";
+        return "SETZEN: PLAYER + BANKER PAIR";
+    }
+
