@@ -40,6 +40,9 @@
 #include "evolution_chip_test_script.h"
 #include "evolution_widget_recovery_script.h"
 #include "evolution_activity_script.h"
+#include "casino_profile.h"
+#include "readonly_diagnostics.h"
+#include "pragmatic_hand_integrity.h"
 
 #pragma comment(lib, "winhttp.lib")
 #pragma comment(lib, "comctl32.lib")
@@ -1309,7 +1312,8 @@ static std::optional<WsUrl> ParseWsUrl(const std::string& u8) {
 
 class CaptureWriter {
 public:
-    CaptureWriter() {
+    explicit CaptureWriter(bool enabled = true) {
+        if (!enabled) return;
         std::filesystem::create_directories("captures");
         SYSTEMTIME st{}; GetLocalTime(&st);
         wchar_t name[128];
@@ -1357,6 +1361,18 @@ enum class ProviderMode {
     Evolution = 0,
     PragmaticPlay = 1
 };
+
+static casino_profile::Casino LoadCasinoSelection() {
+    wchar_t key[32]{};
+    const auto ini = SettingsIniPath();
+    GetPrivateProfileStringW(L"Casino", L"Selected", L"betify", key, 32, ini.c_str());
+    return casino_profile::FromKey(key);
+}
+
+static void SaveCasinoSelection(casino_profile::Casino casino) {
+    const auto ini = SettingsIniPath();
+    WritePrivateProfileStringW(L"Casino", L"Selected", casino_profile::Get(casino).key, ini.c_str());
+}
 
 static const wchar_t* ProviderDisplayName(ProviderMode p) {
     return p == ProviderMode::PragmaticPlay ? L"Pragmatic Play" : L"Evolution";
@@ -1435,14 +1451,26 @@ static bool LaunchChromeDebugBat(const wchar_t* mode = nullptr) {
 class CdpMonitor {
 public:
     CdpMonitor(HWND hwnd, Counters& counters, ProviderMode provider, bool startupPrepareOnly = false,
-               StrategyMode strategy = StrategyMode::LuckyPairs)
-        : hwnd_(hwnd), counters_(counters), provider_(provider), strategy_(strategy),
+               StrategyMode strategy = StrategyMode::LuckyPairs, bool diagnosticOnly = false)
+        : hwnd_(hwnd), counters_(counters), capture_(!diagnosticOnly), provider_(provider), diagnosticOnly_(diagnosticOnly), strategy_(strategy),
           startupPrepareOnly_(startupPrepareOnly) {}
     ~CdpMonitor() { Stop(); }
 
     void Start(std::wstring endpoint, bool loginBeforeProviderOnStart = false) {
         Stop();
         endpoint_ = std::move(endpoint);
+        if (diagnosticOnly_) {
+            stop_ = false;
+            worker_ = std::thread([this]{
+                try { RunReadOnlyDiagnostic(); }
+                catch (...) {
+                    stop_ = true;
+                    CloseHandles();
+                    Log(L"ROOSTERBET DIAGNOSE – interner Lesefehler; Diagnose beendet, Anwendung bleibt geöffnet.");
+                }
+            });
+            return;
+        }
         {
             std::lock_guard<std::mutex> g(evolutionLaunchBudgetMu_);
             evolutionPageLaunchBudget_ = {};
@@ -1589,6 +1617,15 @@ public:
 
     void Stop() {
         stop_ = true;
+        if (diagnosticOnly_) {
+            {
+                std::lock_guard<std::mutex> g(wsMu_);
+                if (hWebSocket_) WinHttpWebSocketClose(hWebSocket_, WINHTTP_WEB_SOCKET_SUCCESS_CLOSE_STATUS, nullptr, 0);
+            }
+            if (worker_.joinable()) worker_.join();
+            CloseHandles();
+            return;
+        }
         HINTERNET ws = nullptr;
         {
             std::lock_guard<std::mutex> g(wsMu_);
@@ -1950,6 +1987,10 @@ private:
         int realMainBetStakeCents{0};
         int realMainBetStakeUnitsX100{0};
         bool realMainBetSettled{false};
+        // A disputed settlement must not be overwritten by a later signal.
+        // This latch survives shoe changes; a session reset clears the runtime.
+        bool resultAccountingUncertain{false};
+        std::string lastRejectedResultGameId;
         // v21.2.90: one virtual decision per live game. It models the same
         // MinEdge opportunity twice: (A) all technically valid signals and
         // (B) only signals with combinedExpectedUnits > 0. No real click is
@@ -3513,7 +3554,7 @@ return'burn-multi:'+TARGETS.length;
     std::optional<std::pair<double,double>>
     PragmaticStrategyMath(const PragmaticTableRuntime& st) const {
         if (strategy_ != StrategyMode::LuckyPairs) return std::nullopt;
-        if (!st.shoeTracked || !st.shoeTrusted || !st.strategyReady ||
+        if (st.resultAccountingUncertain || !st.shoeTracked || !st.shoeTrusted || !st.strategyReady ||
             st.strategyRanks.empty())
             return std::nullopt;
 
@@ -7635,6 +7676,8 @@ return walk(window,'root',0,0)?'conflict-continue-ready':'conflict-continue-not-
     }
 
     std::string PragmaticStatus(const PragmaticTableRuntime& st) const {
+        if (st.resultAccountingUncertain)
+            return "Abrechnung unklar - Tisch gesperrt bis Session-Reset";
         // v21.2.12: keep the Status column intentionally minimal.
         // Cards, hand count, card count, P(Pair), Edge and Signal all have
         // their own dedicated columns.
@@ -7712,6 +7755,58 @@ return walk(window,'root',0,0)?'conflict-continue-ready':'conflict-continue-not-
                               st.strategySignalHits, st.strategySignalPairBets,
                               st.strategyValidSetzenSignals);
         }
+    }
+
+    void PragmaticRejectInconsistentResult(const std::string& tableId,
+            PragmaticTableRuntime& st, const std::string& gameId,
+            const std::string& reportedResult, const pragmatic_hand_integrity::Result& integrity) {
+        const bool unsettledMain = st.realMainBetGameId == gameId &&
+            !st.realMainBetSettled && st.realMainBetStakeCents > 0;
+        const bool unsettledPairs = (st.armedSignalGameId == gameId &&
+            st.armedSignalIsActual && st.armedSignalPairMask != 0) ||
+            (st.pendingPlacementGameId == gameId && st.pendingPlacementConfirmedPairMask != 0) ||
+            (st.telegramSignalPending && st.telegramSignalTargetGameId == gameId &&
+             st.telegramSignalAutoBetMode == 2 && st.telegramSignalConfirmedPairMask != 0);
+        st.resultAccountingUncertain = st.resultAccountingUncertain || unsettledMain || unsettledPairs;
+        st.shoeTrusted = false;
+        st.pendingEndTrusted = false;
+        st.strategyReady = false;
+        st.pendingSignalForBetsOpen = false;
+        st.pendingSignalSourceGameId.clear();
+        st.pendingStakePlan = PragmaticStakePlan{};
+        st.comparisonGameId.clear();
+        st.comparisonStakePlan = PragmaticStakePlan{};
+        // Preserve confirmed stakes for reconciliation; never invent a refund
+        // or a win from contradictory cards. Unfunded candidates can be dropped.
+        if (!st.resultAccountingUncertain) {
+            st.armedSignalGameId.clear();
+            st.armedSignalPairMask = 0;
+            PragmaticClearPendingPlacement(st);
+            st.telegramSignalPending = false;
+        }
+        st.phase = st.resultAccountingUncertain
+            ? "Abrechnung unklar - Tisch gesperrt bis Session-Reset"
+            : "Karten/Ergebnis widersprüchlich - Schuh unsicher";
+        {
+            std::lock_guard<std::mutex> guard(pragmaticBetsOpenMu_);
+            pragmaticBetsOpenGameByTable_.erase(tableId);
+        }
+        if (st.lastRejectedResultGameId == gameId) return;
+        st.lastRejectedResultGameId = gameId;
+        counters_.pragmaticHandsIncomplete.fetch_add(1, std::memory_order_relaxed);
+        capture_.WriteRaw(
+            "{\"kind\":\"PRAGMATIC_HAND_INTEGRITY_REJECTED\",\"iso\":\"" + IsoNow() +
+            "\",\"tableid\":\"" + JsonEscape(tableId) +
+            "\",\"tableName\":\"" + JsonEscape(st.name) +
+            "\",\"gameId\":\"" + JsonEscape(gameId) +
+            "\",\"reason\":\"" + JsonEscape(integrity.reason) +
+            "\",\"reportedResult\":\"" + JsonEscape(reportedResult) +
+            "\",\"playerCards\":" + PragmaticJsonCards(st.playerCards) +
+            ",\"bankerCards\":" + PragmaticJsonCards(st.bankerCards) +
+            ",\"playerPoints\":" + std::to_string(integrity.playerPoints) +
+            ",\"bankerPoints\":" + std::to_string(integrity.bankerPoints) +
+            ",\"accountingUncertain\":" + std::string(st.resultAccountingUncertain ? "true" : "false") + "}");
+        Log(L"PRAGMATIC INTEGRITÄT – " + Utf8ToWide(st.name) + L": " + Utf8ToWide(st.phase));
     }
 
     void PragmaticResetGame(PragmaticTableRuntime& st,
@@ -8540,7 +8635,7 @@ return walk(window,'root',0,0)?'conflict-continue-ready':'conflict-continue-not-
                 st.currentGame == *gameId &&
                 st.startedFromBetsOpen &&
                 total >= 4 && total <= 6 &&
-                pc >= 2 && bc >= 2;
+                pc >= 2 && pc <= 3 && bc >= 2 && bc <= 3;
 
             const bool playerPair = PragmaticPair(st.playerCards);
             const bool bankerPair = PragmaticPair(st.bankerCards);
@@ -8564,6 +8659,25 @@ return walk(window,'root',0,0)?'conflict-continue-ready':'conflict-continue-not-
                     "\",\"gameId\":\"" + JsonEscape(*gameId) + "\"}"
                 );
                 return;
+            }
+            // Validate before any real/paper settlement or rank subtraction.
+            // Pair agreement alone cannot detect a corrected/redealt hand.
+            if (st.currentGame == *gameId && st.startedFromBetsOpen) {
+                auto integrity = pragmatic_hand_integrity::Check(st.playerCards, st.bankerCards, result);
+                bool ppKnown = false, pp = false, bpKnown = false, bp = false;
+                PragmaticBoolLike(payload, "player_pair", ppKnown, pp);
+                PragmaticBoolLike(payload, "banker_pair", bpKnown, bp);
+                const bool reliablePairs = st.rawName != "BIG_SMALL_BACCARAT" && st.name != "Big Small Baccarat";
+                if (integrity.valid && reliablePairs &&
+                    ((ppKnown && pp != playerPair) || (bpKnown && bp != bankerPair))) {
+                    integrity.valid = false;
+                    integrity.reason = "cards-pair-flags-mismatch";
+                }
+                if (!integrity.valid) {
+                    PragmaticRejectInconsistentResult(*tableId, st, *gameId, result, integrity);
+                    PostPragmaticStatus(*tableId, st);
+                    return;
+                }
             }
             if (complete) st.lastCompletedGameId = *gameId;
 
@@ -9760,7 +9874,8 @@ return walk(window,'root',0,0)?'conflict-continue-ready':'conflict-continue-not-
 
     uint64_t NextId() { return ++nextId_; }
 
-    bool SendRaw(const std::string& json) {
+    bool SendRaw(const std::string& json, bool diagnosticRead = false) {
+        if (diagnosticOnly_ && !diagnosticRead) return false;
         std::lock_guard<std::mutex> g(sendMu_);
         HINTERNET ws = nullptr;
         {
@@ -20357,7 +20472,10 @@ return'balance-emitted';
         HandleConsole(json);
     }
 
+    #include "readonly_diagnostic_methods.h"
+
     void Run() {
+        if (diagnosticOnly_) { RunReadOnlyDiagnostic(); return; }
         MonitorAwake awake(!startupPrepareOnly_);
         if (!startupPrepareOnly_) {
             capture_.WriteRaw("{\"kind\":\"MONITOR_IDLE_SLEEP_GUARD\",\"iso\":\"" + IsoNow() +
@@ -20487,6 +20605,7 @@ private:
     std::string pragmaticLastProbeFingerprint_;
 
     ProviderMode provider_{ProviderMode::Evolution};
+    const bool diagnosticOnly_ = false;
     std::mutex evolutionLaunchBudgetMu_;
     evolution_start_policy::Budget evolutionPageLaunchBudget_;
     std::string evolutionLaunchWaitLog_;
@@ -20701,6 +20820,8 @@ private:
 
 struct AppState {
     HWND hwnd{};
+    HWND casinoLabel{};
+    HWND casinoCombo{};
     HWND providerLabel{};
     HWND providerCombo{};
     HWND strategyLabel{};
@@ -20788,6 +20909,7 @@ struct AppState {
     std::unique_ptr<CdpMonitor> startupPrepMonitor;
 
     ProviderMode activeProvider{ProviderMode::Evolution};
+    casino_profile::Casino activeCasino{casino_profile::Casino::Betify};
     StrategyMode activeStrategy{StrategyMode::LuckyPairs};
     bool observing{false};
     ULONGLONG observationStartTick{0};
@@ -21387,8 +21509,9 @@ static session_export::Record SnapshotSessionRecord(const AppState* a) {
     if (record.startBalanceMinor || record.endBalanceMinor)
         record.balanceCurrency = WideToUtf8(a->balanceCurrency);
     record.source = a->activeProvider == ProviderMode::Evolution
-        ? "Baccarat Counter v21.2.123; Evolution; Modellvergleich manueller Setzsignale, Einsätze nicht bestätigt"
-        : "Baccarat Counter v21.2.123; Pragmatic; Modellvergleich idealisiert technisch ausführbare MinEdge-Signale";
+        ? "Baccarat Counter v21.2.124; Evolution; Modellvergleich manueller Setzsignale, Einsätze nicht bestätigt"
+        : "Baccarat Counter v21.2.124; Pragmatic; Modellvergleich idealisiert technisch ausführbare MinEdge-Signale";
+    record.source += "; Casino=" + WideToUtf8(casino_profile::Get(a->activeCasino).name);
     return record;
 }
 
@@ -21854,12 +21977,15 @@ static void Layout(HWND hwnd, AppState* a) {
     // Combo boxes need dropdown height; single-line edit controls must stay at
     // one row. Giving an EDIT the combo height makes its client area cover the
     // status and tab below it when WS_CLIPCHILDREN is active.
-    auto row = rowCells({220, 190, 135, 150, 135});
-    moveLabeledCell(a->providerLabel, a->providerCombo, row[0], 72, 250);
-    moveLabeledCell(a->strategyLabel, a->strategyCombo, row[1], 72, 250);
-    moveLabeledCell(a->unitTargetLabel, a->unitTargetEdit, row[2], 72, 30);
-    moveLabeledCell(a->pairChipLabel, a->pairChipEdit, row[3], 92, 30);
-    moveLabeledCell(a->stopLossLabel, a->stopLossEdit, row[4], 72, 30);
+    auto row = rowCells({220, 250, 190});
+    moveLabeledCell(a->casinoLabel, a->casinoCombo, row[0], 65, 250);
+    moveLabeledCell(a->providerLabel, a->providerCombo, row[1], 72, 250);
+    moveLabeledCell(a->strategyLabel, a->strategyCombo, row[2], 72, 250);
+    y += rowStep;
+    row = rowCells({135, 150, 135});
+    moveLabeledCell(a->unitTargetLabel, a->unitTargetEdit, row[0], 72, 30);
+    moveLabeledCell(a->pairChipLabel, a->pairChipEdit, row[1], 92, 30);
+    moveLabeledCell(a->stopLossLabel, a->stopLossEdit, row[2], 72, 30);
 
     // The two thresholds share their own row so neither label gets clipped
     // at the supported minimum window width. Both inputs use percentage units.
@@ -21992,6 +22118,14 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             a->fontStatus = CreateFontSimple(-20, FW_SEMIBOLD, L"Segoe UI Semibold");
             a->fontList = CreateFontSimple(-22, FW_SEMIBOLD, L"Segoe UI");
 
+            a->casinoLabel = CreateWindowW(L"STATIC", L"Casino:", WS_CHILD|WS_VISIBLE, 0,0,0,0, hwnd,nullptr,nullptr,nullptr);
+            a->casinoCombo = CreateWindowW(WC_COMBOBOXW, L"",
+                WS_CHILD|WS_VISIBLE|CBS_DROPDOWNLIST|WS_VSCROLL,
+                0,0,0,0, hwnd,(HMENU)150,nullptr,nullptr);
+            for (const auto& casino : casino_profile::profiles)
+                SendMessageW(a->casinoCombo, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(casino.name));
+            a->activeCasino = LoadCasinoSelection();
+            SendMessageW(a->casinoCombo, CB_SETCURSEL, static_cast<WPARAM>(a->activeCasino), 0);
             a->providerLabel = CreateWindowW(L"STATIC", L"Anbieter:", WS_CHILD|WS_VISIBLE, 0,0,0,0, hwnd,nullptr,nullptr,nullptr);
             a->providerCombo = CreateWindowW(WC_COMBOBOXW, L"",
                                              WS_CHILD|WS_VISIBLE|CBS_DROPDOWNLIST|WS_VSCROLL,
@@ -22206,6 +22340,9 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                                      WS_CHILD|WS_VSCROLL|ES_MULTILINE|ES_AUTOVSCROLL|ES_READONLY,
                                      0,0,0,0, hwnd,(HMENU)108,nullptr,nullptr);
             SendMessageW(a->log, WM_SETFONT, reinterpret_cast<WPARAM>(GetStockObject(ANSI_FIXED_FONT)), TRUE);
+            // AppendLog trims at 120000 characters; the EDIT limit must allow
+            // reaching that threshold instead of silently dropping new lines.
+            SendMessageW(a->log, EM_SETLIMITTEXT, 200000, 0);
 
             a->summaryHeadline = CreateWindowW(L"STATIC", L"Gesamt P/L: 0 Units",
                                                WS_CHILD|SS_LEFTNOWORDWRAP, 0,0,0,0, hwnd,(HMENU)116,nullptr,nullptr);
@@ -22231,6 +22368,8 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
 
             if (a->fontUi) {
                 SendMessageW(a->providerLabel, WM_SETFONT, reinterpret_cast<WPARAM>(a->fontUi), TRUE);
+                SendMessageW(a->casinoLabel, WM_SETFONT, reinterpret_cast<WPARAM>(a->fontUi), TRUE);
+                SendMessageW(a->casinoCombo, WM_SETFONT, reinterpret_cast<WPARAM>(a->fontUi), TRUE);
                 SendMessageW(a->providerCombo, WM_SETFONT, reinterpret_cast<WPARAM>(a->fontUi), TRUE);
                 SendMessageW(a->strategyLabel, WM_SETFONT, reinterpret_cast<WPARAM>(a->fontUi), TRUE);
                 SendMessageW(a->strategyCombo, WM_SETFONT, reinterpret_cast<WPARAM>(a->fontUi), TRUE);
@@ -22529,6 +22668,21 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                 return 0;
             }
             switch (LOWORD(wParam)) {
+                case 150: {
+                    if (HIWORD(wParam) != CBN_SELCHANGE) return 0;
+                    if (a->observing || a->sessionInitialized) {
+                        SendMessageW(a->casinoCombo, CB_SETCURSEL, static_cast<WPARAM>(a->activeCasino), 0);
+                        AppendLog(a->log, L"Casino-Wechsel: zuerst die laufende Session stoppen und Reset verwenden, damit Kontostände und Ergebnisse getrennt bleiben.");
+                        return 0;
+                    }
+                    a->activeCasino = SendMessageW(a->casinoCombo, CB_GETCURSEL, 0, 0) == 1
+                        ? casino_profile::Casino::Roosterbet : casino_profile::Casino::Betify;
+                    SaveCasinoSelection(a->activeCasino);
+                    AppendLog(a->log, std::wstring(L"Casino ausgewählt: ") + casino_profile::Get(a->activeCasino).name);
+                    if (!casino_profile::Get(a->activeCasino).launchVerified)
+                        AppendLog(a->log, L"Roosterbet: Pragmatic-Diagnose liest den bestehenden Spieltab. Ausgabe im Protokoll; keine Wettfunktionen oder automatische Navigation.");
+                    return 0;
+                }
                 case 109: {
                     if (!a->observing && HIWORD(wParam) == CBN_SELCHANGE) {
                         const int providerSel = static_cast<int>(
@@ -22580,6 +22734,24 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                     return 0;
                 }
                 case 102: {
+                    // Roosterbet diagnostics never enter the existing Betify connection path.
+                    if (!casino_profile::Get(a->activeCasino).launchVerified) {
+                        if (SendMessageW(a->providerCombo, CB_GETCURSEL, 0, 0) != 1) {
+                            AppendLog(a->log, L"Roosterbet/Evolution: Spieladresse und Einbettung fehlen noch. Bitte Pragmatic für die vorhandene Diagnose wählen.");
+                            return 0;
+                        }
+                        if (a->monitor) a->monitor->Stop();
+                        if (a->startupPrepMonitor) a->startupPrepMonitor->Stop();
+                        a->monitor = std::make_unique<CdpMonitor>(hwnd, a->counters,
+                            ProviderMode::PragmaticPlay, false, StrategyMode::LuckyPairs, true);
+                        EnableWindow(a->manualChipTestBtn, FALSE);
+                        EnableWindow(a->connectBtn, FALSE);
+                        EnableWindow(a->casinoCombo, FALSE);
+                        EnableWindow(a->providerCombo, FALSE);
+                        AppendLog(a->log, L"Roosterbet: rein lesende Diagnose. Casino- und Provider-Guthaben bleiben getrennt; nicht sichtbare Werte bleiben unbekannt. Ergebnisse im Protokoll, keine Session-Abrechnung.");
+                        a->monitor->Start(L"http://127.0.0.1:9222", false);
+                        return 0;
+                    }
                     {
                         wchar_t token[256]{};
                         GetWindowTextW(a->telegramBotTokenEdit, token, 256);
@@ -22739,6 +22911,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
 
                     EnableWindow(a->connectBtn, FALSE);
                     EnableWindow(a->providerCombo, FALSE);
+                    EnableWindow(a->casinoCombo, FALSE);
                     EnableWindow(a->strategyCombo, FALSE);
                     EnableWindow(a->unitTargetEdit, FALSE);
                     EnableWindow(a->pairChipEdit, FALSE);
@@ -22938,6 +23111,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                     a->endBalanceMinor = a->currentBalanceMinor;
                     EnableWindow(a->connectBtn, TRUE);
                     EnableWindow(a->providerCombo, TRUE);
+                    EnableWindow(a->casinoCombo, TRUE);
                     EnableWindow(a->strategyCombo, TRUE);
                     EnableWindow(a->minEdgeEdit, TRUE);
                     EnableWindow(a->combinedMinEdgeEdit, TRUE);
@@ -22968,6 +23142,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                     EnableWindow(a->connectBtn, TRUE);
                     EnableWindow(a->stopBtn, TRUE);
                     EnableWindow(a->providerCombo, TRUE);
+                    EnableWindow(a->casinoCombo, TRUE);
                     EnableWindow(a->strategyCombo, TRUE);
                     EnableWindow(a->minEdgeEdit, TRUE);
                     EnableWindow(a->combinedMinEdgeEdit, TRUE);
@@ -23146,6 +23321,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                 EnableWindow(a->connectBtn, FALSE);
                 EnableWindow(a->stopBtn, FALSE);
                 EnableWindow(a->providerCombo, FALSE);
+                EnableWindow(a->casinoCombo, FALSE);
                 EnableWindow(a->strategyCombo, FALSE);
                 EnableWindow(a->minEdgeEdit, FALSE);
                 EnableWindow(a->combinedMinEdgeEdit, FALSE);
@@ -23202,6 +23378,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                 EnableWindow(a->connectBtn, FALSE);
                 EnableWindow(a->stopBtn, FALSE);
                 EnableWindow(a->providerCombo, FALSE);
+                EnableWindow(a->casinoCombo, FALSE);
                 EnableWindow(a->strategyCombo, FALSE);
                 EnableWindow(a->minEdgeEdit, FALSE);
                 EnableWindow(a->combinedMinEdgeEdit, FALSE);
@@ -23370,7 +23547,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                     }
                     return reinterpret_cast<INT_PTR>(a->brushStatus ? a->brushStatus : GetSysColorBrush(COLOR_WINDOW));
                 }
-                if (ctrl == a->providerLabel || ctrl == a->strategyLabel ||
+                if (ctrl == a->casinoLabel || ctrl == a->providerLabel || ctrl == a->strategyLabel ||
                     ctrl == a->minEdgeLabel || ctrl == a->combinedMinEdgeLabel ||
                     ctrl == a->edgeBasisHint || ctrl == a->unitTargetLabel ||
                     ctrl == a->stopLossLabel) {
@@ -23448,7 +23625,7 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int nCmdShow) {
         initialX = workArea.left + std::max(0, (workWidth - initialWidth) / 2);
         initialY = workArea.top + std::max(0, (workHeight - initialHeight) / 2);
     }
-    HWND hwnd = CreateWindowExW(0, CLASS_NAME, L"Baccarat Counter v21.2.123 – Sessionauswertung",
+    HWND hwnd = CreateWindowExW(0, CLASS_NAME, L"Baccarat Counter v21.2.124 – Entwicklung / Casino-Auswahl",
                                 WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN,
                                 initialX, initialY, initialWidth, initialHeight,
                                 nullptr, nullptr, hInst, &state);
