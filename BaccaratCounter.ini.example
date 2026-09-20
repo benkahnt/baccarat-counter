@@ -1,0 +1,19 @@
+[Casino]
+; Available keys: betify, roosterbet. Roosterbet launch awaits navigation scan.
+Selected=betify
+
+[Strategy]
+; Pair-MinEdge in percent; legacy key is retained.
+MinEdgePercent=2.00
+; Gesamt-MinEdge in percent of the complete stake (used when CombinedEvFilter=1).
+CombinedMinEdgePercent=0.00
+UnitTarget=20
+StopLoss=-50
+PairChipEUR=2.00
+CombinedEvFilter=0
+
+[Telegram]
+Enabled=0
+SignalEnabled=0
+BotToken=
+ChatId=

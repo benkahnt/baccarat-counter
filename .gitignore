@@ -1,0 +1,7 @@
+BaccaratCounter.ini
+captures/
+sessions/
+.validation/
+__pycache__/
+*.obj
+*.pdb
